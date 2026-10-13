@@ -1,0 +1,22 @@
+stages:
+  - build
+
+build-spark-image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - mkdir -p /kaniko/.docker
+    - printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}' "$CI_REGISTRY" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" > /kaniko/.docker/config.json
+    - |
+      set -- \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/Dockerfile" \
+        --destination "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        set -- "$@" --destination "$CI_REGISTRY_IMAGE:latest"
+      fi
+      /kaniko/executor "$@"
