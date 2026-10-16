@@ -8,6 +8,7 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,6 +21,7 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.functions;
+import org.apache.spark.sql.types.DataTypes;
 import za.co.absa.abris.avro.functions$;
 import za.co.absa.abris.config.AbrisConfig$;
 import za.co.absa.abris.config.ToAvroConfig;
@@ -59,6 +61,15 @@ public final class AlertsToKafka {
             String query = buildQuery(options, schemaVersion.fields());
             Dataset<Row> alerts = spark.sql(query);
             Dataset<Row> encodedAlerts = alerts.select(
+                    functions.udf(
+                            (Long diaSourceId) -> diaSourceId == null
+                                ? null
+                                : ByteBuffer.allocate(Long.BYTES)
+                                    .putLong(diaSourceId)
+                                    .array(),
+                            DataTypes.BinaryType)
+                        .apply(functions.col("value.diaSourceId"))
+                        .alias("key"),
                     functions$.MODULE$
                             .to_avro(functions.col("value"), avroConfig)
                             .alias("value"));
