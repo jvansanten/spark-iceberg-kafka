@@ -51,6 +51,17 @@
             <version>4.1.3</version>
             <scope>provided</scope>
         </dependency>
+        <!--
+          Parquet's ParquetWriter.Builder API references org.apache.hadoop.fs.Path.
+          Spark provides the shaded Hadoop client at runtime, so this is only
+          needed on the compile classpath and must not be bundled.
+        -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client-api</artifactId>
+            <version>3.4.2</version>
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
 
     <build>
