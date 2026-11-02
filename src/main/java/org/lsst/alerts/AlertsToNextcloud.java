@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -55,6 +56,7 @@ import org.apache.spark.sql.types.FloatType;
 import org.apache.spark.sql.types.IntegerType;
 import org.apache.spark.sql.types.LongType;
 import org.apache.spark.sql.types.MapType;
+import org.apache.spark.sql.types.NullType;
 import org.apache.spark.sql.types.ShortType;
 import org.apache.spark.sql.types.StringType;
 import org.apache.spark.sql.types.StructField;
@@ -378,15 +380,69 @@ public final class AlertsToNextcloud {
                     .named(name);
         }
         if (dataType instanceof StructType struct) {
-            List<Type> fields = new ArrayList<>();
-            for (StructField field : struct.fields()) {
-                fields.add(convertField(field));
-            }
-            return Types.buildGroup(repetition).addFields(fields.toArray(Type[]::new)).named(name);
+            return convertStructType(struct, repetition, name);
+        }
+        if (dataType instanceof ArrayType array) {
+            return convertArrayType(array, repetition, name);
+        }
+        if (dataType instanceof MapType map) {
+            return convertMapType(map, repetition, name);
+        }
+        if (dataType instanceof NullType) {
+            // Parquet has no void type; Spark itself writes NullType as a nullable
+            // int32 whose values are always absent. Guard the repetition so the
+            // resulting column is always optional regardless of the declared field.
+            return Types.optional(PrimitiveTypeName.INT32).named(name);
         }
         throw new UnsupportedOperationException(
-                "Unsupported Spark type for Parquet export (v1): " + dataType.typeName()
-                        + " -- arrays, maps and other complex types are not yet supported");
+                "Unsupported Spark type for Parquet export: " + dataType.typeName());
+    }
+
+    private static Type convertStructType(StructType struct, Type.Repetition repetition, String name) {
+        List<Type> fields = new ArrayList<>();
+        for (StructField field : struct.fields()) {
+            fields.add(convertField(field));
+        }
+        return Types.buildGroup(repetition).addFields(fields.toArray(Type[]::new)).named(name);
+    }
+
+    /**
+     * Maps a Spark {@link ArrayType} onto the Parquet three-level {@code LIST}
+     * layout: an optional/repeated group {@code <name>} containing a repeated
+     * group {@code list} that in turn holds the element field. This is the
+     * canonical representation understood by Spark, DuckDB and pyarrow.
+     */
+    private static Type convertArrayType(ArrayType array, Type.Repetition repetition, String name) {
+        Type element = convertType(
+                array.elementType(),
+                array.containsNull() ? Type.Repetition.OPTIONAL : Type.Repetition.REQUIRED,
+                "element");
+        return Types.buildGroup(repetition)
+                .addField(Types.buildGroup(Type.Repetition.REPEATED)
+                        .addField(element)
+                        .named("list"))
+                .as(LogicalTypeAnnotation.listType())
+                .named(name);
+    }
+
+    /**
+     * Maps a Spark {@link MapType} onto the Parquet canonical map layout: a
+     * repeated group {@code key_value} with a required {@code key} field and a
+     * value field whose nullability follows {@link MapType#valueContainsNull()}.
+     */
+    private static Type convertMapType(MapType map, Type.Repetition repetition, String name) {
+        Type key = convertType(map.keyType(), Type.Repetition.REQUIRED, "key");
+        Type value = convertType(
+                map.valueType(),
+                map.valueContainsNull() ? Type.Repetition.OPTIONAL : Type.Repetition.REQUIRED,
+                "value");
+        return Types.buildGroup(repetition)
+                .addField(Types.buildGroup(Type.Repetition.REPEATED)
+                        .addField(key)
+                        .addField(value)
+                        .named("key_value"))
+                .as(LogicalTypeAnnotation.mapType())
+                .named(name);
     }
 
     private static int decimalMaxBytes(DecimalType decimal) {
@@ -417,17 +473,91 @@ public final class AlertsToNextcloud {
 
     private static void appendValue(Group group, int fieldIndex, Type fieldType, Object value) {
         if (fieldType.isPrimitive()) {
-            appendPrimitive(group, fieldIndex, fieldType.asPrimitiveType().getPrimitiveTypeName(), value);
-        } else {
-            appendRow(group.addGroup(fieldIndex), (Row) value, fieldType.asGroupType(), 0);
+            appendPrimitive(group, fieldIndex, fieldType.asPrimitiveType(), value);
+            return;
+        }
+        LogicalTypeAnnotation logicalType = fieldType.getLogicalTypeAnnotation();
+        if (logicalType instanceof LogicalTypeAnnotation.ListLogicalTypeAnnotation) {
+            appendList(group.addGroup(fieldIndex), value);
+            return;
+        }
+        if (logicalType instanceof LogicalTypeAnnotation.MapLogicalTypeAnnotation) {
+            appendMap(group.addGroup(fieldIndex), value);
+            return;
+        }
+        appendRow(group.addGroup(fieldIndex), (Row) value, fieldType.asGroupType(), 0);
+    }
+
+    /**
+     * Appends the elements of a Spark array value to the repeated {@code list}
+     * element field of a Parquet LIST group.
+     */
+    private static void appendList(Group listGroup, Object value) {
+        GroupType listType = listGroup.getType();
+        Type elementType = listType.getType("list").asGroupType().getType(0);
+        for (Object element : asIterable(value)) {
+            Group repeated = listGroup.addGroup("list");
+            if (element == null) {
+                continue;
+            }
+            appendValue(repeated, 0, elementType, element);
         }
     }
 
+    /**
+     * Appends the entries of a Spark map value to the repeated {@code key_value}
+     * group of a Parquet MAP group.
+     */
+    private static void appendMap(Group mapGroup, Object value) {
+        GroupType mapType = mapGroup.getType();
+        GroupType keyValueType = mapType.getType("key_value").asGroupType();
+        Type keyType = keyValueType.getType(0);
+        Type valueType = keyValueType.getType(1);
+        for (Map.Entry<?, ?> entry : asEntryIterable(value)) {
+            Group keyValue = mapGroup.addGroup("key_value");
+            appendValue(keyValue, 0, keyType, entry.getKey());
+            if (entry.getValue() != null) {
+                appendValue(keyValue, 1, valueType, entry.getValue());
+            }
+        }
+    }
+
+    /** Adapts the several runtime representations Spark uses for arrays to an {@link Iterable}. */
+    private static Iterable<?> asIterable(Object value) {
+        if (value instanceof Iterable<?> iterable) {
+            return iterable;
+        }
+        if (value instanceof Object[] array) {
+            return Arrays.asList(array);
+        }
+        if (value instanceof scala.collection.Seq<?> seq) {
+            return scala.collection.JavaConverters.seqAsJavaList(seq);
+        }
+        if (value instanceof scala.collection.Iterable<?> iterable) {
+            return scala.collection.JavaConverters.asJavaIterable(iterable);
+        }
+        throw new IllegalArgumentException("Cannot convert array value of type " + value.getClass());
+    }
+
+    /** Adapts the several runtime representations Spark uses for maps to entries. */
+    private static Iterable<? extends Map.Entry<?, ?>> asEntryIterable(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            return map.entrySet();
+        }
+        if (value instanceof scala.collection.Map<?, ?> map) {
+            return scala.collection.JavaConverters.mapAsJavaMap(map).entrySet();
+        }
+        throw new IllegalArgumentException("Cannot convert map value of type " + value.getClass());
+    }
+
     private static void appendPrimitive(
-            Group group, int fieldIndex, PrimitiveTypeName typeName, Object value) {
+            Group group, int fieldIndex, org.apache.parquet.schema.PrimitiveType fieldType, Object value) {
+        PrimitiveTypeName typeName = fieldType.getPrimitiveTypeName();
         switch (typeName) {
             case INT32 -> {
-                if (value instanceof LocalDate date) {
+                if (value instanceof java.sql.Date date) {
+                    group.add(fieldIndex, (int) date.toLocalDate().toEpochDay());
+                } else if (value instanceof LocalDate date) {
                     group.add(fieldIndex, (int) date.toEpochDay());
                 } else if (value instanceof Number number) {
                     group.add(fieldIndex, number.intValue());
@@ -435,21 +565,37 @@ public final class AlertsToNextcloud {
                     group.add(fieldIndex, (int) value);
                 }
             }
-            case INT64 -> {
-                if (value instanceof java.sql.Timestamp timestamp) {
-                    group.add(fieldIndex, timestamp.getTime() * 1000L);
-                } else {
-                    group.add(fieldIndex, ((Number) value).longValue());
-                }
-            }
+            case INT64 -> group.add(fieldIndex, toEpochMicros(value));
             case FLOAT -> group.add(fieldIndex, ((Number) value).floatValue());
             case DOUBLE -> group.add(fieldIndex, ((Number) value).doubleValue());
             case BOOLEAN -> group.add(fieldIndex, (boolean) value);
             case BINARY -> group.add(fieldIndex, toBinary(value));
-            case FIXED_LEN_BYTE_ARRAY -> group.add(fieldIndex, toBinary(value));
+            case FIXED_LEN_BYTE_ARRAY -> group.add(fieldIndex, toFixedBinary(value, fieldType.getTypeLength()));
             default -> throw new UnsupportedOperationException(
                     "Unsupported Parquet primitive type: " + typeName);
         }
+    }
+
+    /**
+     * Converts the several temporal representations Spark uses for timestamps
+     * into microseconds since the Unix epoch (the Parquet TIMESTAMP unit).
+     */
+    private static long toEpochMicros(Object value) {
+        if (value instanceof java.sql.Timestamp timestamp) {
+            return timestamp.getTime() * 1000L;
+        }
+        if (value instanceof java.time.Instant instant) {
+            return instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1_000L;
+        }
+        if (value instanceof java.time.LocalDateTime localDateTime) {
+            return localDateTime.toInstant(java.time.ZoneOffset.UTC).getEpochSecond() * 1_000_000L
+                    + localDateTime.getNano() / 1_000L;
+        }
+        if (value instanceof java.time.OffsetDateTime offsetDateTime) {
+            java.time.Instant instant = offsetDateTime.toInstant();
+            return instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1_000L;
+        }
+        return ((Number) value).longValue();
     }
 
     private static Binary toBinary(Object value) {
@@ -464,6 +610,36 @@ public final class AlertsToNextcloud {
             return Binary.fromConstantByteArray(decimal.unscaledValue().toByteArray());
         }
         return Binary.fromString(value.toString());
+    }
+
+    /**
+     * Encodes a value into a FIXED_LEN_BYTE_ARRAY of exactly {@code length}
+     * bytes, sign-extending decimals into the full column width.
+     */
+    private static Binary toFixedBinary(Object value, int length) {
+        byte[] bytes;
+        if (value instanceof BigDecimal decimal) {
+            bytes = decimal.unscaledValue().toByteArray();
+        } else if (value instanceof byte[] raw) {
+            bytes = raw;
+        } else if (value instanceof Binary binary) {
+            bytes = binary.getBytes();
+        } else {
+            bytes = value.toString().getBytes(StandardCharsets.UTF_8);
+        }
+        if (bytes.length == length) {
+            return Binary.fromConstantByteArray(bytes);
+        }
+        if (bytes.length > length) {
+            throw new IllegalArgumentException(
+                    "Value of " + bytes.length + " bytes does not fit in fixed length " + length);
+        }
+        // Pad on the left, preserving the sign bit (two's complement).
+        byte pad = (bytes.length > 0 && bytes[0] < 0) ? (byte) 0xFF : (byte) 0x00;
+        byte[] padded = new byte[length];
+        Arrays.fill(padded, 0, length - bytes.length, pad);
+        System.arraycopy(bytes, 0, padded, length - bytes.length, bytes.length);
+        return Binary.fromConstantByteArray(padded);
     }
 
     /**
