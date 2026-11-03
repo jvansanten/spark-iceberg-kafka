@@ -109,8 +109,11 @@ public final class AlertsToNextcloud {
             Dataset<Row> alerts = spark.sql(buildQuery(options));
             Dataset<Row> projected = applySchemaExclusions(alerts, options.schemaExclude);
 
-            MessageType parquetSchema = convertToParquetSchema(projected.schema());
-            List<String> downloadUrls = uploadPartitions(projected, parquetSchema, options);
+            // Apply adaptive coalescing based on max partition size if specified
+            Dataset<Row> finalDataset = maybeCoalesceBySize(projected, options);
+
+            MessageType parquetSchema = convertToParquetSchema(finalDataset.schema());
+            List<String> downloadUrls = uploadPartitions(finalDataset, parquetSchema, options);
 
             for (String url : downloadUrls) {
                 System.out.println(url);
@@ -163,6 +166,76 @@ public final class AlertsToNextcloud {
     }
 
     /**
+     * Adaptively coalesces partitions based on estimated size if maxPartitionBytes is set.
+     * Uses Spark's statistics to estimate total size and calculates optimal partition count.
+     */
+    private static Dataset<Row> maybeCoalesceBySize(Dataset<Row> dataset, Arguments options) {
+        if (options.maxPartitionBytes == null) {
+            return dataset;
+        }
+        
+        // Get current number of partitions
+        int currentPartitions = dataset.rdd().getNumPartitions();
+        
+        // Estimate average row size from schema
+        // Rough estimation: sum of field sizes based on type
+        long estimatedRowSize = estimateRowSize(dataset.schema());
+        
+        // Estimate total size
+        long estimatedTotalRows = dataset.count();
+        long estimatedTotalBytes = estimatedTotalRows * estimatedRowSize;
+        
+        // Calculate target partition count
+        int targetPartitions = (int) Math.ceil((double) estimatedTotalBytes / options.maxPartitionBytes);
+        targetPartitions = Math.max(1, targetPartitions);
+        
+        // Only coalesce if we'd reduce the number of partitions
+        if (targetPartitions < currentPartitions) {
+            System.err.printf("Coalescing from %d to %d partitions (estimated %.2f MB)%n",
+                    currentPartitions, targetPartitions, estimatedTotalBytes / (1024.0 * 1024));
+            return dataset.coalesce(targetPartitions);
+        }
+        
+        return dataset;
+    }
+
+    /**
+     * Estimates the average row size in bytes based on the schema.
+     * This is a rough heuristic for determining partition sizing.
+     */
+    private static long estimateRowSize(StructType schema) {
+        long size = 0;
+        for (StructField field : schema.fields()) {
+            size += estimateTypeSize(field.dataType());
+        }
+        return size;
+    }
+
+    private static long estimateTypeSize(DataType type) {
+        if (type instanceof ByteType) return 1;
+        if (type instanceof ShortType) return 2;
+        if (type instanceof IntegerType) return 4;
+        if (type instanceof LongType) return 8;
+        if (type instanceof FloatType) return 4;
+        if (type instanceof DoubleType) return 8;
+        if (type instanceof BooleanType) return 1;
+        if (type instanceof StringType) return 50; // Average string length guess
+        if (type instanceof BinaryType) return 100; // Average binary size guess
+        if (type instanceof TimestampType || type instanceof DateType) return 8;
+        if (type instanceof DecimalType dt) return dt.precision() <= 18 ? 8 : 16;
+        if (type instanceof StructType st) {
+            long structSize = 0;
+            for (StructField f : st.fields()) {
+                structSize += estimateTypeSize(f.dataType());
+            }
+            return structSize;
+        }
+        if (type instanceof ArrayType at) return 10 + estimateTypeSize(at.elementType()); // Overhead + avg element
+        if (type instanceof MapType mt) return 20 + estimateTypeSize(mt.keyType()) + estimateTypeSize(mt.valueType());
+        return 10; // Default fallback
+    }
+
+    /**
      * Streams every Spark partition of {@code alerts} to Nextcloud as a single
      * Zstd-compressed Parquet object, and returns the read-only download URL of
      * each uploaded object.
@@ -179,17 +252,22 @@ public final class AlertsToNextcloud {
         
         JavaRDD<String> urlRDD = alerts.rdd()
                 .toJavaRDD()
-                .mapPartitions(it -> {
+                .mapPartitionsWithIndex((index, it) -> {
                     // Recreate Parquet schema from Spark schema on each worker
                     MessageType workerParquetSchema = convertToParquetSchema(sparkSchema);
-                    return uploadPartition(it, workerParquetSchema, options);
-                });
+                    // Materialize the partition into a list to detach from Spark internals
+                    List<Row> rowsList = new ArrayList<>();
+                    while (it.hasNext()) {
+                        rowsList.add(it.next());
+                    }
+                    return uploadPartitionFromList(index, rowsList.iterator(), workerParquetSchema, options);
+                }, true);
         return urlRDD.collect();
     }
 
-    private static Iterator<String> uploadPartition(
-            Iterator<Row> iterator, MessageType parquetSchema, Arguments options) {
-        int partitionId = TaskContext.get().partitionId();
+    private static Iterator<String> uploadPartitionFromList(
+            int partitionIndex, Iterator<Row> iterator, MessageType parquetSchema, Arguments options) {
+        int partitionId = partitionIndex;
         String filename = options.filenamePrefix + "_part-" + partitionId + ".parquet";
         String webDavUrl = buildWebDavUrl(options.nextcloudBaseUrl, options.nextcloudUploadToken, filename);
         String downloadUrl = buildDownloadUrl(
@@ -838,6 +916,7 @@ public final class AlertsToNextcloud {
         private String nextcloudDownloadToken;
         private String filenamePrefix;
         private int waitSeconds;
+        private Long maxPartitionBytes;
 
         private static Arguments parse(String[] args) {
             Arguments options = new Arguments();
@@ -873,6 +952,7 @@ public final class AlertsToNextcloud {
                     case "--nextcloud-download-token" -> options.nextcloudDownloadToken = value;
                     case "--filename-prefix" -> options.filenamePrefix = value;
                     case "--wait" -> options.waitSeconds = Integer.parseInt(value);
+                    case "--max-partition-bytes" -> options.maxPartitionBytes = parseBytes(value);
                     default -> throw new IllegalArgumentException("Unknown option: " + option);
                 }
             }
@@ -905,8 +985,30 @@ public final class AlertsToNextcloud {
                       --nextcloud-upload-token <token>
                       --nextcloud-download-token <token>
                       --filename-prefix <prefix>
+                      --max-partition-bytes <size>  (e.g., 1GB, 500MB, 100000000)
                       --wait <seconds>
                     """);
+        }
+
+        private static long parseBytes(String value) {
+            value = value.trim().toUpperCase();
+            long multiplier = 1;
+            if (value.endsWith("KB")) {
+                multiplier = 1024L;
+                value = value.substring(0, value.length() - 2);
+            } else if (value.endsWith("MB")) {
+                multiplier = 1024L * 1024;
+                value = value.substring(0, value.length() - 2);
+            } else if (value.endsWith("GB")) {
+                multiplier = 1024L * 1024 * 1024;
+                value = value.substring(0, value.length() - 2);
+            } else if (value.endsWith("TB")) {
+                multiplier = 1024L * 1024 * 1024 * 1024;
+                value = value.substring(0, value.length() - 2);
+            } else if (value.endsWith("B")) {
+                value = value.substring(0, value.length() - 1);
+            }
+            return Long.parseLong(value) * multiplier;
         }
     }
 }
