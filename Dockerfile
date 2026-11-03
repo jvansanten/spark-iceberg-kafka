@@ -3,7 +3,7 @@ FROM maven:3.9.9-eclipse-temurin-17 AS dependencies
 WORKDIR /build
 COPY pom.xml .
 COPY src ./src
-RUN mvn -B -ntp package \
+RUN mvn -B -ntp package -DskipTests \
     org.apache.maven.plugins:maven-dependency-plugin:3.8.1:copy-dependencies \
     -DincludeScope=runtime \
     -DoutputDirectory=/build/dependencies
