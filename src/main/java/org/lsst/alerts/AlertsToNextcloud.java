@@ -680,9 +680,8 @@ public final class AlertsToNextcloud {
         return normalizeBaseUrl(baseUrl)
                 + "/index.php/s/"
                 + token
-                + "/"
-                + encodePathSegment(filename)
-                + "?download";
+                + "/download?path="
+                + encodePathSegment("/" + filename);
     }
 
     private static String normalizeBaseUrl(String baseUrl) {
