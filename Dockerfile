@@ -1,4 +1,4 @@
-FROM maven:3.9.9-eclipse-temurin-17@sha256:f58d59b6273e785ac0a4477f6e9b5ba1d7731c75b906c0f7b34076f1851318cc AS dependencies
+FROM maven:3.10.0-eclipse-temurin-17@sha256:b67db904974d04b9e6eba5b073ae227569ee1cae0d1f26be8993525291ef76dc AS dependencies
 
 WORKDIR /build
 COPY pom.xml .
