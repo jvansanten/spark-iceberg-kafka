@@ -1,5 +1,20 @@
 stages:
+  - test
   - build
+
+.test-template:
+  image: eclipse-temurin:17-jdk
+  before_script:
+    - apt-get update && apt-get install -y maven
+
+run-tests:
+  extends: .test-template
+  stage: test
+  script:
+    - cd /builds/$CI_PROJECT_PATH
+    - mvn test
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
 
 build-spark-image:
   stage: build
