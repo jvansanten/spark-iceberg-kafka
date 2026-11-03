@@ -3,7 +3,7 @@ stages:
   - build
 
 .test-template:
-  image: eclipse-temurin:17-jdk
+  image: eclipse-temurin:17-jdk@sha256:91011320978c10ec51d2cde1eb6f616db6d2a739a0e521096c343dd3fed9abe6
   before_script:
     - apt-get update && apt-get install -y maven
 
@@ -19,7 +19,7 @@ run-tests:
 build-spark-image:
   stage: build
   image:
-    name: gcr.io/kaniko-project/executor:v1.24.0-debug
+    name: gcr.io/kaniko-project/executor:v1.24.0-debug@sha256:2562c4fe551399514277ffff7dcca9a3b1628c4ea38cb017d7286dc6ea52f4cd
     entrypoint: [""]
   rules:
     - if: '$CI_COMMIT_BRANCH'

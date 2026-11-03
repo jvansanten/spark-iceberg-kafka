@@ -1,4 +1,4 @@
-FROM maven:3.9.9-eclipse-temurin-17 AS dependencies
+FROM maven:3.9.9-eclipse-temurin-17@sha256:f58d59b6273e785ac0a4477f6e9b5ba1d7731c75b906c0f7b34076f1851318cc AS dependencies
 
 WORKDIR /build
 COPY pom.xml .
@@ -8,7 +8,7 @@ RUN mvn -B -ntp package -DskipTests \
     -DincludeScope=runtime \
     -DoutputDirectory=/build/dependencies
 
-FROM docker.io/apache/spark:4.1.3-python3
+FROM docker.io/apache/spark:4.1.3-python3@sha256:bf9d035a7c32a8ca46aa58d6348182ffd7d2dff6409206ecfbb3915ff1fef211
 
 COPY --from=dependencies /build/dependencies/ /opt/spark/jars/
 COPY --from=dependencies /build/target/spark-iceberg-kafka-image-1.0.0.jar /opt/spark/app/alerts-to-kafka.jar
