@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
+import java.io.Serializable;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -39,11 +40,11 @@ import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 import org.apache.parquet.schema.Type;
 import org.apache.parquet.schema.Types;
-import org.apache.spark.TaskContext;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.TaskContext;
 import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.BinaryType;
 import org.apache.spark.sql.types.BooleanType;
@@ -172,9 +173,17 @@ public final class AlertsToNextcloud {
      */
     private static List<String> uploadPartitions(
             Dataset<Row> alerts, MessageType parquetSchema, Arguments options) {
+        // Broadcast the Spark schema (which IS serializable) instead of the Parquet schema
+        // We'll convert to Parquet schema on each worker
+        StructType sparkSchema = alerts.schema();
+        
         JavaRDD<String> urlRDD = alerts.rdd()
                 .toJavaRDD()
-                .mapPartitions(iterator -> uploadPartition(iterator, parquetSchema, options));
+                .mapPartitions(it -> {
+                    // Recreate Parquet schema from Spark schema on each worker
+                    MessageType workerParquetSchema = convertToParquetSchema(sparkSchema);
+                    return uploadPartition(it, workerParquetSchema, options);
+                });
         return urlRDD.collect();
     }
 
@@ -820,7 +829,7 @@ public final class AlertsToNextcloud {
         }
     }
 
-    private static final class Arguments {
+    private static final class Arguments implements Serializable {
         private String where = DEFAULT_WHERE;
         private Integer limit;
         private String orderBy;
