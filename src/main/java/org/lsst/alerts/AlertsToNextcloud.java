@@ -179,7 +179,7 @@ public final class AlertsToNextcloud {
         
         // Estimate average row size from schema
         // Rough estimation: sum of field sizes based on type
-        long estimatedRowSize = estimateRowSize(dataset.schema());
+        long estimatedRowSize = estimateRowSize(dataset.schema(), options.estimatedArrayCardinality);
         
         // Estimate total size
         long estimatedTotalRows = dataset.count();
@@ -203,15 +203,15 @@ public final class AlertsToNextcloud {
      * Estimates the average row size in bytes based on the schema.
      * This is a rough heuristic for determining partition sizing.
      */
-    private static long estimateRowSize(StructType schema) {
+    private static long estimateRowSize(StructType schema, int arrayCardinality) {
         long size = 0;
         for (StructField field : schema.fields()) {
-            size += estimateTypeSize(field.dataType());
+            size += estimateTypeSize(field.dataType(), arrayCardinality);
         }
         return size;
     }
 
-    private static long estimateTypeSize(DataType type) {
+    private static long estimateTypeSize(DataType type, int arrayCardinality) {
         if (type instanceof ByteType) return 1;
         if (type instanceof ShortType) return 2;
         if (type instanceof IntegerType) return 4;
@@ -226,12 +226,12 @@ public final class AlertsToNextcloud {
         if (type instanceof StructType st) {
             long structSize = 0;
             for (StructField f : st.fields()) {
-                structSize += estimateTypeSize(f.dataType());
+                structSize += estimateTypeSize(f.dataType(), arrayCardinality);
             }
             return structSize;
         }
-        if (type instanceof ArrayType at) return 10 + estimateTypeSize(at.elementType()); // Overhead + avg element
-        if (type instanceof MapType mt) return 20 + estimateTypeSize(mt.keyType()) + estimateTypeSize(mt.valueType());
+        if (type instanceof ArrayType at) return 10 + (arrayCardinality * estimateTypeSize(at.elementType(), arrayCardinality)); // Overhead + avg elements
+        if (type instanceof MapType mt) return 20 + (arrayCardinality * (estimateTypeSize(mt.keyType(), arrayCardinality) + estimateTypeSize(mt.valueType(), arrayCardinality)));
         return 10; // Default fallback
     }
 
@@ -917,6 +917,7 @@ public final class AlertsToNextcloud {
         private String filenamePrefix;
         private int waitSeconds;
         private Long maxPartitionBytes;
+        private Integer estimatedArrayCardinality = 10;
 
         private static Arguments parse(String[] args) {
             Arguments options = new Arguments();
@@ -953,6 +954,7 @@ public final class AlertsToNextcloud {
                     case "--filename-prefix" -> options.filenamePrefix = value;
                     case "--wait" -> options.waitSeconds = Integer.parseInt(value);
                     case "--max-partition-bytes" -> options.maxPartitionBytes = parseBytes(value);
+                    case "--estimated-array-cardinality" -> options.estimatedArrayCardinality = Integer.parseInt(value);
                     default -> throw new IllegalArgumentException("Unknown option: " + option);
                 }
             }
@@ -986,6 +988,7 @@ public final class AlertsToNextcloud {
                       --nextcloud-download-token <token>
                       --filename-prefix <prefix>
                       --max-partition-bytes <size>  (e.g., 1GB, 500MB, 100000000)
+                      --estimated-array-cardinality <n>  (default: 10)
                       --wait <seconds>
                     """);
         }
