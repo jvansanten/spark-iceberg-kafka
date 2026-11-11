@@ -47,18 +47,23 @@ public final class AlertsToKafka {
 
     public static void main(String[] args) throws Exception {
         Arguments options = Arguments.parse(args);
-        SchemaVersion schemaVersion = latestSchema(options.schemaRegistry, options.subject);
+        SchemaVersion schemaVersion = null;
+        Integer schemaId = options.schemaId;
+        if (schemaId == null) {
+            schemaVersion = latestSchema(options.schemaRegistry, options.subject);
+            schemaId = schemaVersion.id();
+        }
 
         ToAvroConfig avroConfig = AbrisConfig$.MODULE$
                 .toConfluentAvro()
-                .downloadSchemaById(schemaVersion.id())
+                .downloadSchemaById(schemaId)
                 .usingSchemaRegistry(options.schemaRegistry);
 
         SparkSession spark = SparkSession.builder()
                 .appName("AlertsToKafka")
                 .getOrCreate();
         try {
-            String query = buildQuery(options, schemaVersion.fields());
+            String query = buildQuery(options, schemaVersion != null ? schemaVersion.fields() : null);
             Dataset<Row> alerts = spark.sql(query);
             Dataset<Row> encodedAlerts = alerts.select(
                     functions.udf(
@@ -98,11 +103,17 @@ public final class AlertsToKafka {
     }
 
     private static String buildQuery(Arguments options, List<String> schemaFields) {
-        List<String> columns = schemaFields.stream()
-                .filter(field -> !options.schemaExclude.contains(field))
-                .toList();
-        if (columns.isEmpty()) {
-            throw new IllegalArgumentException("Schema exclusions removed every schema field");
+        List<String> columns;
+        if (schemaFields != null) {
+            columns = schemaFields.stream()
+                    .filter(field -> !options.schemaExclude.contains(field))
+                    .toList();
+            if (columns.isEmpty()) {
+                throw new IllegalArgumentException("Schema exclusions removed every schema field");
+            }
+        } else {
+            // When using --schema-id, we select all columns and let Abris handle the schema
+            columns = List.of("*");
         }
 
         StringBuilder query = new StringBuilder("""
@@ -172,6 +183,7 @@ public final class AlertsToKafka {
         private String orderBy;
         private String schemaRegistry = DEFAULT_SCHEMA_REGISTRY;
         private String subject = "alert-packet";
+        private Integer schemaId = null;
         private Set<String> schemaExclude = new LinkedHashSet<>(DEFAULT_SCHEMA_EXCLUDE);
         private String topic = DEFAULT_TOPIC;
         private String kafkaBootstrapServers = DEFAULT_KAFKA_BOOTSTRAP_SERVERS;
@@ -211,7 +223,18 @@ public final class AlertsToKafka {
                     case "--limit" -> options.limit = Integer.parseInt(value);
                     case "--order-by" -> options.orderBy = value;
                     case "--schema-registry" -> options.schemaRegistry = value;
-                    case "--subject" -> options.subject = value;
+                    case "--subject" -> {
+                        if (options.schemaId != null) {
+                            throw new IllegalArgumentException("--subject and --schema-id are mutually exclusive");
+                        }
+                        options.subject = value;
+                    }
+                    case "--schema-id" -> {
+                        if (!options.subject.equals("alert-packet")) {
+                            throw new IllegalArgumentException("--subject and --schema-id are mutually exclusive");
+                        }
+                        options.schemaId = Integer.parseInt(value);
+                    }
                     case "--topic" -> options.topic = value;
                     case "--kafka-bootstrap-servers" -> options.kafkaBootstrapServers = value;
                     case "--kafka-sasl-jaas-config" -> options.jaasConfig = Path.of(value);
@@ -233,7 +256,8 @@ public final class AlertsToKafka {
                       --limit <count>
                       --order-by <sql-expression>
                       --schema-registry <url>
-                      --subject <schema-registry-subject>
+                      --subject <schema-registry-subject>  (mutually exclusive with --schema-id)
+                      --schema-id <id>                       (mutually exclusive with --subject)
                       --schema-exclude <field> [<field> ...]
                       --topic <name>
                       --kafka-bootstrap-servers <servers>
