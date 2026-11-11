@@ -261,7 +261,7 @@ public final class AlertsToKafka {
                         if (!options.subject.equals("alert-packet")) {
                             throw new IllegalArgumentException("--subject and --schema-id are mutually exclusive");
                         }
-                        options.schemaId = Integer.parseInt(value);
+                        options.schemaId = value.isEmpty() ? null : Integer.parseInt(value);
                     }
                     case "--topic" -> options.topic = value;
                     case "--kafka-bootstrap-servers" -> options.kafkaBootstrapServers = value;
