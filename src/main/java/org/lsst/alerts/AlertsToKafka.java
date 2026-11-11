@@ -47,18 +47,25 @@ public final class AlertsToKafka {
 
     public static void main(String[] args) throws Exception {
         Arguments options = Arguments.parse(args);
-        SchemaVersion schemaVersion = latestSchema(options.schemaRegistry, options.subject);
+        SchemaVersion schemaVersion;
+        Integer schemaId = options.schemaId;
+        if (schemaId != null) {
+            schemaVersion = schemaById(options.schemaRegistry, schemaId);
+        } else {
+            schemaVersion = latestSchema(options.schemaRegistry, options.subject);
+            schemaId = schemaVersion.id();
+        }
 
         ToAvroConfig avroConfig = AbrisConfig$.MODULE$
                 .toConfluentAvro()
-                .downloadSchemaById(schemaVersion.id())
+                .downloadSchemaById(schemaId)
                 .usingSchemaRegistry(options.schemaRegistry);
 
         SparkSession spark = SparkSession.builder()
                 .appName("AlertsToKafka")
                 .getOrCreate();
         try {
-            String query = buildQuery(options, schemaVersion.fields());
+            String query = buildQuery(options, schemaVersion != null ? schemaVersion.fields() : null);
             Dataset<Row> alerts = spark.sql(query);
             Dataset<Row> encodedAlerts = alerts.select(
                     functions.udf(
@@ -122,6 +129,38 @@ public final class AlertsToKafka {
         return query.toString();
     }
 
+    private static SchemaVersion schemaById(String registryUrl, int schemaId)
+            throws IOException, InterruptedException {
+        String normalizedRegistryUrl = registryUrl.replaceAll("/+$", "");
+        URI uri = URI.create(normalizedRegistryUrl + "/schemas/ids/" + schemaId);
+        HttpRequest request = HttpRequest.newBuilder(uri).GET().build();
+        HttpResponse<String> response = HttpClient.newHttpClient().send(
+                request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("Schema Registry returned HTTP " + response.statusCode()
+                    + " for schema ID " + schemaId + ": " + response.body());
+        }
+
+        JsonNode schemaNode = new ObjectMapper().readTree(response.body());
+        JsonNode fieldsNode = schemaNode.get("fields");
+        if (fieldsNode == null || !fieldsNode.isArray()) {
+            throw new IOException("Schema with ID " + schemaId + " has no fields array");
+        }
+
+        List<String> fields = new ArrayList<>();
+        for (JsonNode field : fieldsNode) {
+            JsonNode name = field.get("name");
+            if (name != null && name.isTextual()) {
+                fields.add(name.textValue());
+            }
+        }
+        if (fields.isEmpty()) {
+            throw new IOException("Schema with ID " + schemaId + " has no named fields");
+        }
+        return new SchemaVersion(schemaId, List.copyOf(fields));
+    }
+
     private static SchemaVersion latestSchema(String registryUrl, String subject)
             throws IOException, InterruptedException {
         String normalizedRegistryUrl = registryUrl.replaceAll("/+$", "");
@@ -172,6 +211,7 @@ public final class AlertsToKafka {
         private String orderBy;
         private String schemaRegistry = DEFAULT_SCHEMA_REGISTRY;
         private String subject = "alert-packet";
+        private Integer schemaId = null;
         private Set<String> schemaExclude = new LinkedHashSet<>(DEFAULT_SCHEMA_EXCLUDE);
         private String topic = DEFAULT_TOPIC;
         private String kafkaBootstrapServers = DEFAULT_KAFKA_BOOTSTRAP_SERVERS;
@@ -211,7 +251,18 @@ public final class AlertsToKafka {
                     case "--limit" -> options.limit = Integer.parseInt(value);
                     case "--order-by" -> options.orderBy = value;
                     case "--schema-registry" -> options.schemaRegistry = value;
-                    case "--subject" -> options.subject = value;
+                    case "--subject" -> {
+                        if (options.schemaId != null) {
+                            throw new IllegalArgumentException("--subject and --schema-id are mutually exclusive");
+                        }
+                        options.subject = value;
+                    }
+                    case "--schema-id" -> {
+                        if (!options.subject.equals("alert-packet")) {
+                            throw new IllegalArgumentException("--subject and --schema-id are mutually exclusive");
+                        }
+                        options.schemaId = Integer.parseInt(value);
+                    }
                     case "--topic" -> options.topic = value;
                     case "--kafka-bootstrap-servers" -> options.kafkaBootstrapServers = value;
                     case "--kafka-sasl-jaas-config" -> options.jaasConfig = Path.of(value);
@@ -233,7 +284,8 @@ public final class AlertsToKafka {
                       --limit <count>
                       --order-by <sql-expression>
                       --schema-registry <url>
-                      --subject <schema-registry-subject>
+                      --subject <schema-registry-subject>  (mutually exclusive with --schema-id)
+                      --schema-id <id>                       (mutually exclusive with --subject)
                       --schema-exclude <field> [<field> ...]
                       --topic <name>
                       --kafka-bootstrap-servers <servers>
