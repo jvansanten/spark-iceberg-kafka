@@ -1,13 +1,13 @@
 package org.lsst.alerts;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import io.confluent.kafka.schemaregistry.ParsedSchema;
+import io.confluent.kafka.schemaregistry.avro.AvroSchema;
+import io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient;
+import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
+import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
+import io.confluent.kafka.schemaregistry.client.SchemaRegistryClientConfig;
 import java.io.IOException;
-import java.net.URI;
 import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -129,78 +129,28 @@ public final class AlertsToKafka {
         return query.toString();
     }
 
-    private static SchemaVersion schemaById(String registryUrl, int schemaId)
-            throws IOException, InterruptedException {
-        String normalizedRegistryUrl = registryUrl.replaceAll("/+$", "");
-        URI uri = URI.create(normalizedRegistryUrl + "/schemas/ids/" + schemaId);
-        HttpRequest request = HttpRequest.newBuilder(uri).GET().build();
-        HttpResponse<String> response = HttpClient.newHttpClient().send(
-                request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new IOException("Schema Registry returned HTTP " + response.statusCode()
-                    + " for schema ID " + schemaId + ": " + response.body());
-        }
-
-        JsonNode schemaNode = new ObjectMapper().readTree(response.body());
-        JsonNode fieldsNode = schemaNode.get("fields");
-        if (fieldsNode == null || !fieldsNode.isArray()) {
-            throw new IOException("Schema with ID " + schemaId + " has no fields array");
-        }
-
-        List<String> fields = new ArrayList<>();
-        for (JsonNode field : fieldsNode) {
-            JsonNode name = field.get("name");
-            if (name != null && name.isTextual()) {
-                fields.add(name.textValue());
+    private static SchemaVersion schemaById(String registryUrl, int schemaId) throws IOException, RestClientException {
+        try (SchemaRegistryClient client = new CachedSchemaRegistryClient(registryUrl, 100)) {
+            ParsedSchema schema = client.getSchemaById(schemaId);
+            if (!(schema instanceof AvroSchema)) {
+                throw new IOException("Schema ID " + schemaId + " is not an Avro schema");
             }
+            AvroSchema avroSchema = (AvroSchema) schema;
+            List<String> fields = avroSchema.rawSchema().getFields().stream()
+                    .map(f -> f.name())
+                    .toList();
+            if (fields.isEmpty()) {
+                throw new IOException("Schema with ID " + schemaId + " has no named fields");
+            }
+            return new SchemaVersion(schemaId, fields);
         }
-        if (fields.isEmpty()) {
-            throw new IOException("Schema with ID " + schemaId + " has no named fields");
-        }
-        return new SchemaVersion(schemaId, List.copyOf(fields));
     }
 
-    private static SchemaVersion latestSchema(String registryUrl, String subject)
-            throws IOException, InterruptedException {
-        String normalizedRegistryUrl = registryUrl.replaceAll("/+$", "");
-        String encodedSubject = URLEncoder.encode(subject, StandardCharsets.UTF_8)
-                .replace("+", "%20");
-        URI uri = URI.create(normalizedRegistryUrl + "/subjects/" + encodedSubject + "/versions/latest");
-        HttpRequest request = HttpRequest.newBuilder(uri).GET().build();
-        HttpResponse<String> response = HttpClient.newHttpClient().send(
-                request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new IOException("Schema Registry returned HTTP " + response.statusCode()
-                    + " for subject " + subject + ": " + response.body());
+    private static SchemaVersion latestSchema(String registryUrl, String subject) throws IOException, RestClientException {
+        try (SchemaRegistryClient client = new CachedSchemaRegistryClient(registryUrl, 100)) {
+            int schemaId = client.getLatestSchemaMetadata(subject).getId();
+            return schemaById(registryUrl, schemaId);
         }
-
-        JsonNode latest = new ObjectMapper().readTree(response.body());
-        JsonNode id = latest.get("id");
-        JsonNode schemaText = latest.get("schema");
-        if (id == null || !id.canConvertToInt() || schemaText == null || !schemaText.isTextual()) {
-            throw new IOException("Latest schema response is missing an integer id or schema for subject "
-                    + subject);
-        }
-
-        JsonNode schema = new ObjectMapper().readTree(schemaText.textValue());
-        JsonNode fieldsNode = schema.get("fields");
-        if (fieldsNode == null || !fieldsNode.isArray()) {
-            throw new IOException("Latest schema has no fields array for subject " + subject);
-        }
-
-        List<String> fields = new ArrayList<>();
-        for (JsonNode field : fieldsNode) {
-            JsonNode name = field.get("name");
-            if (name != null && name.isTextual()) {
-                fields.add(name.textValue());
-            }
-        }
-        if (fields.isEmpty()) {
-            throw new IOException("Latest schema has no named fields for subject " + subject);
-        }
-        return new SchemaVersion(id.intValue(), List.copyOf(fields));
     }
 
     private record SchemaVersion(int id, List<String> fields) {}
