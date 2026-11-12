@@ -8,7 +8,7 @@ RUN mvn -B -ntp package -DskipTests \
     -DincludeScope=runtime \
     -DoutputDirectory=/build/dependencies
 
-FROM docker.io/apache/spark:4.2.1-python3@sha256:0cb70cf0193ec81c93c6c47078208512bbe659dd9dc89535dd2773826f0ea2bf
+FROM docker.io/apache/spark:4.1.3-python3
 
 COPY --from=dependencies /build/dependencies/ /opt/spark/jars/
 COPY --from=dependencies /build/target/spark-iceberg-kafka-image-1.0.0.jar /opt/spark/app/alerts-to-kafka.jar
