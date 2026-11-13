@@ -13,10 +13,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import org.apache.avro.Schema;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -65,7 +69,7 @@ public final class AlertsToKafka {
                 .appName("AlertsToKafka")
                 .getOrCreate();
         try {
-            String query = buildQuery(options, schemaVersion != null ? schemaVersion.fields() : null);
+            String query = buildQuery(options, schemaVersion.avroSchema());
             Dataset<Row> alerts = spark.sql(query);
             Dataset<Row> encodedAlerts = alerts.select(
                     functions.udf(
@@ -104,12 +108,30 @@ public final class AlertsToKafka {
         }
     }
 
-    private static String buildQuery(Arguments options, List<String> schemaFields) {
-        List<String> columns = schemaFields.stream()
-                .filter(field -> !options.schemaExclude.contains(field))
-                .toList();
-        if (columns.isEmpty()) {
+    /**
+     * Builds a SQL query that constructs a struct matching the target Avro schema.
+     * This ensures that only fields present in the target schema are selected,
+     * avoiding serialization errors when the source table has additional fields.
+     */
+    private static String buildQuery(Arguments options, Schema avroSchema) {
+        if (avroSchema == null || avroSchema.getType() != Schema.Type.RECORD) {
+            throw new IllegalArgumentException("Target schema must be a RECORD type");
+        }
+
+        // Filter out excluded top-level fields
+        List<Schema.Field> filteredFields = avroSchema.getFields().stream()
+                .filter(field -> !options.schemaExclude.contains(field.name()))
+                .collect(Collectors.toList());
+
+        if (filteredFields.isEmpty()) {
             throw new IllegalArgumentException("Schema exclusions removed every schema field");
+        }
+
+        // Recursively build column expressions for each field
+        List<String> columnExpressions = new ArrayList<>();
+        for (Schema.Field field : filteredFields) {
+            String expression = buildColumnExpression(field.schema(), field.name(), "");
+            columnExpressions.add(expression);
         }
 
         StringBuilder query = new StringBuilder("""
@@ -118,7 +140,8 @@ public final class AlertsToKafka {
                     %s
                   ) as value
                   from lsst.alerts where %s""".formatted(
-                String.join(",\n    ", columns), options.where));
+                String.join(",\n    ", columnExpressions),
+                options.where));
 
         if (options.orderBy != null) {
             query.append(" order by ").append(options.orderBy);
@@ -129,6 +152,99 @@ public final class AlertsToKafka {
         return query.toString();
     }
 
+    /**
+     * Checks if a schema represents a primitive type (including enums and fixed).
+     * In Avro, primitive types are: STRING, INT, LONG, FLOAT, DOUBLE, BOOLEAN, BYTES, NULL
+     */
+    private static boolean isPrimitiveType(Schema schema) {
+        Schema.Type type = schema.getType();
+        return type == Schema.Type.STRING ||
+               type == Schema.Type.INT ||
+               type == Schema.Type.LONG ||
+               type == Schema.Type.FLOAT ||
+               type == Schema.Type.DOUBLE ||
+               type == Schema.Type.BOOLEAN ||
+               type == Schema.Type.BYTES ||
+               type == Schema.Type.NULL ||
+               type == Schema.Type.ENUM ||
+               type == Schema.Type.FIXED;
+    }
+
+    /**
+     * Recursively builds a SQL column expression for a given Avro schema.
+     * Handles primitive types, arrays, maps, unions, and nested records.
+     *
+     * @param schema The Avro schema for the field
+     * @param fieldName The name of the field
+     * @param prefix The dot-separated path to reach this field (used for qualified access)
+     * @return SQL expression string for this field
+     */
+    private static String buildColumnExpression(Schema schema, String fieldName, String prefix) {
+        String fullPath = prefix.isEmpty() ? fieldName : prefix + "." + fieldName;
+
+        // Resolve union types - get the actual type (non-null part)
+        Schema resolvedSchema = resolveUnion(schema);
+        Schema.Type type = resolvedSchema.getType();
+
+        if (isPrimitiveType(resolvedSchema)) {
+            // Primitive types: directly reference the column
+            return fullPath;
+        } else if (type == Schema.Type.RECORD) {
+            // Nested record: build a struct() expression recursively
+            List<String> nestedFields = new ArrayList<>();
+            for (Schema.Field nestedField : resolvedSchema.getFields()) {
+                String nestedExpr = buildColumnExpression(nestedField.schema(), nestedField.name(), fullPath);
+                nestedFields.add(nestedExpr + " as " + nestedField.name());
+            }
+            return "struct(" + String.join(", ", nestedFields) + ") as " + fieldName;
+        } else if (type == Schema.Type.ARRAY) {
+            // Array type: reference directly (Iceberg/Spark will handle the array)
+            return fullPath;
+        } else if (type == Schema.Type.MAP) {
+            // Map type: reference directly
+            return fullPath;
+        } else if (type == Schema.Type.UNION) {
+            // Should have been resolved above, fallback to direct reference
+            return fullPath;
+        } else {
+            throw new UnsupportedOperationException("Unsupported schema type: " + type);
+        }
+    }
+
+    /**
+     * Resolves a union type to its non-null member.
+     * If the union contains both null and another type, returns the non-null type.
+     * Otherwise returns the schema as-is.
+     */
+    private static Schema resolveUnion(Schema schema) {
+        if (schema.getType() != Schema.Type.UNION) {
+            return schema;
+        }
+
+        List<Schema> types = schema.getTypes();
+        if (types.size() == 2) {
+            // Common case: ["null", SomeType]
+            Schema first = types.get(0);
+            Schema second = types.get(1);
+            
+            if (first.getType() == Schema.Type.NULL) {
+                return second;
+            }
+            if (second.getType() == Schema.Type.NULL) {
+                return first;
+            }
+        }
+        
+        // For more complex unions, just return the first non-null type
+        for (Schema type : types) {
+            if (type.getType() != Schema.Type.NULL) {
+                return type;
+            }
+        }
+        
+        return schema;
+    }
+
     private static SchemaVersion schemaById(String registryUrl, int schemaId) throws IOException, RestClientException {
         try (SchemaRegistryClient client = new CachedSchemaRegistryClient(registryUrl, 100)) {
             ParsedSchema schema = client.getSchemaById(schemaId);
@@ -136,13 +252,13 @@ public final class AlertsToKafka {
                 throw new IOException("Schema ID " + schemaId + " is not an Avro schema");
             }
             AvroSchema avroSchema = (AvroSchema) schema;
-            List<String> fields = avroSchema.rawSchema().getFields().stream()
-                    .map(f -> f.name())
-                    .toList();
-            if (fields.isEmpty()) {
-                throw new IOException("Schema with ID " + schemaId + " has no named fields");
+            Schema parsedSchema = avroSchema.rawSchema();
+            
+            if (parsedSchema.getType() != Schema.Type.RECORD) {
+                throw new IOException("Schema with ID " + schemaId + " is not a RECORD type");
             }
-            return new SchemaVersion(schemaId, fields);
+            
+            return new SchemaVersion(schemaId, parsedSchema);
         }
     }
 
@@ -153,9 +269,9 @@ public final class AlertsToKafka {
         }
     }
 
-    private record SchemaVersion(int id, List<String> fields) {}
+    private record SchemaVersion(int id, Schema avroSchema) {}
 
-    private static final class Arguments {
+    static final class Arguments {
         private String where = DEFAULT_WHERE;
         private Integer limit;
         private String orderBy;
