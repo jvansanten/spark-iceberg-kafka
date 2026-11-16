@@ -140,7 +140,7 @@ public class TestAlertsToKafkaNestedStruct {
     void testBuildArrayOfPrimitives() throws Exception {
         Schema arraySchema = Schema.createArray(Schema.create(Schema.Type.FLOAT));
         String expr = buildColumnExpression(arraySchema, "values", "");
-        assertEquals("array(values) as values", expr);
+        assertEquals("values", expr);
     }
 
     @Test
@@ -153,7 +153,7 @@ public class TestAlertsToKafkaNestedStruct {
         
         Schema arraySchema = Schema.createArray(pointSchema);
         String expr = buildColumnExpression(arraySchema, "points", "");
-        assertEquals("array(struct(points.x as x, points.y as y)) as points", expr);
+        assertEquals("transform(points, x -> struct(points.x as x, points.y as y)) as points", expr);
     }
 
     @Test
@@ -303,7 +303,7 @@ public class TestAlertsToKafkaNestedStruct {
         String pdfsExpr = buildColumnExpression(
                 Schema.createUnion(Arrays.asList(Schema.create(Schema.Type.NULL), prvDiaForcedSourcesSchema)),
                 "prvDiaForcedSources", "");
-        assertEquals("array(struct(prvDiaForcedSources.diaForcedSourceId as diaForcedSourceId, prvDiaForcedSources.ra as ra)) as prvDiaForcedSources", pdfsExpr);
+        assertEquals("transform(prvDiaForcedSources, x -> struct(prvDiaForcedSources.diaForcedSourceId as diaForcedSourceId, prvDiaForcedSources.ra as ra)) as prvDiaForcedSources", pdfsExpr);
 
         // Test building diaObject (nullable record)
         String dioExpr = buildColumnExpression(
@@ -407,8 +407,8 @@ public class TestAlertsToKafkaNestedStruct {
         System.out.println("Schema 1100 prvDiaSources expression:");
         System.out.println(expr1100);
         
-        // Should contain array(struct(...))
-        assertTrue(expr1100.contains("array(struct("));
+        // Should contain transform(struct(...))
+        assertTrue(expr1100.contains("transform(prvDiaSources, x -> struct("));
         assertTrue(expr1100.contains("as prvDiaSources"));
         // Should include basic fields
         assertTrue(expr1100.contains("prvDiaSources.diaSourceId as diaSourceId"));
@@ -417,18 +417,18 @@ public class TestAlertsToKafkaNestedStruct {
         // CRITICAL: Should NOT include trailAlgorithm
         assertFalse(expr1100.contains("trailAlgorithm"), 
                 "Schema 1100 should NOT include trailAlgorithm in prvDiaSources");
-        
+
         // Test with schema 1102 (with trailAlgorithm)
         Schema prvDiaSourcesSchema1102 = Schema.createArray(diaSourceSchema1102);
         String expr1102 = buildColumnExpression(
                 Schema.createUnion(Arrays.asList(Schema.create(Schema.Type.NULL), prvDiaSourcesSchema1102)),
                 "prvDiaSources", "");
-        
+
         System.out.println("Schema 1102 prvDiaSources expression:");
         System.out.println(expr1102);
-        
-        // Should contain array(struct(...))
-        assertTrue(expr1102.contains("array(struct("));
+
+        // Should contain transform(struct(...))
+        assertTrue(expr1102.contains("transform(prvDiaSources, x -> struct("));
         assertTrue(expr1102.contains("as prvDiaSources"));
         // Should include trailAlgorithm
         assertTrue(expr1102.contains("trailAlgorithm"), 
