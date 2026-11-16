@@ -140,7 +140,7 @@ public class TestAlertsToKafkaNestedStruct {
     void testBuildArrayOfPrimitives() throws Exception {
         Schema arraySchema = Schema.createArray(Schema.create(Schema.Type.FLOAT));
         String expr = buildColumnExpression(arraySchema, "values", "");
-        assertEquals("values", expr);
+        assertEquals("array(values) as values", expr);
     }
 
     @Test
@@ -153,7 +153,7 @@ public class TestAlertsToKafkaNestedStruct {
         
         Schema arraySchema = Schema.createArray(pointSchema);
         String expr = buildColumnExpression(arraySchema, "points", "");
-        assertEquals("points", expr);
+        assertEquals("array(struct(points.x as x, points.y as y)) as points", expr);
     }
 
     @Test
@@ -303,7 +303,7 @@ public class TestAlertsToKafkaNestedStruct {
         String pdfsExpr = buildColumnExpression(
                 Schema.createUnion(Arrays.asList(Schema.create(Schema.Type.NULL), prvDiaForcedSourcesSchema)),
                 "prvDiaForcedSources", "");
-        assertEquals("prvDiaForcedSources", pdfsExpr);
+        assertEquals("array(struct(prvDiaForcedSources.diaForcedSourceId as diaForcedSourceId, prvDiaForcedSources.ra as ra)) as prvDiaForcedSources", pdfsExpr);
 
         // Test building diaObject (nullable record)
         String dioExpr = buildColumnExpression(
@@ -369,5 +369,69 @@ public class TestAlertsToKafkaNestedStruct {
         Schema resolved = resolveUnion(unionSchema);
         // Should pick the first non-null type
         assertEquals(Schema.Type.STRING, resolved.getType());
+    }
+
+    @Test
+    void testPrvDiaSourcesArrayWithSchemaEvolution() throws Exception {
+        // This test simulates the actual problem:
+        // - Schema 1100's prvDiaSources has diaSource elements WITHOUT trailAlgorithm
+        // - Schema 1102's prvDiaSources has diaSource elements WITH trailAlgorithm
+        // When targeting schema 1100, the query should NOT include trailAlgorithm
+        
+        // Schema 1100 diaSource (NO trailAlgorithm)
+        Schema.Field ds1100_diaSourceId = new Schema.Field("diaSourceId", Schema.create(Schema.Type.LONG));
+        Schema.Field ds1100_visit = new Schema.Field("visit", Schema.create(Schema.Type.LONG));
+        Schema.Field ds1100_ra = new Schema.Field("ra", Schema.create(Schema.Type.DOUBLE));
+        Schema.Field ds1100_dec = new Schema.Field("dec", Schema.create(Schema.Type.DOUBLE));
+        
+        Schema diaSourceSchema1100 = Schema.createRecord("diaSource", null, "lsst.v11_0", false);
+        diaSourceSchema1100.setFields(List.of(ds1100_diaSourceId, ds1100_visit, ds1100_ra, ds1100_dec));
+        
+        // Schema 1102 diaSource (WITH trailAlgorithm)
+        Schema.Field ds1102_diaSourceId = new Schema.Field("diaSourceId", Schema.create(Schema.Type.LONG));
+        Schema.Field ds1102_visit = new Schema.Field("visit", Schema.create(Schema.Type.LONG));
+        Schema.Field ds1102_trailingAlgorithm = new Schema.Field("trailAlgorithm", 
+                Schema.createUnion(Arrays.asList(Schema.create(Schema.Type.NULL), Schema.create(Schema.Type.STRING))));
+        Schema.Field ds1102_ra = new Schema.Field("ra", Schema.create(Schema.Type.DOUBLE));
+        Schema.Field ds1102_dec = new Schema.Field("dec", Schema.create(Schema.Type.DOUBLE));
+        
+        Schema diaSourceSchema1102 = Schema.createRecord("diaSource", null, "lsst.v11_2", false);
+        diaSourceSchema1102.setFields(List.of(ds1102_diaSourceId, ds1102_visit, ds1102_trailingAlgorithm, ds1102_ra, ds1102_dec));
+        
+        // Test with schema 1100 (no trailAlgorithm)
+        Schema prvDiaSourcesSchema1100 = Schema.createArray(diaSourceSchema1100);
+        String expr1100 = buildColumnExpression(
+                Schema.createUnion(Arrays.asList(Schema.create(Schema.Type.NULL), prvDiaSourcesSchema1100)),
+                "prvDiaSources", "");
+        
+        System.out.println("Schema 1100 prvDiaSources expression:");
+        System.out.println(expr1100);
+        
+        // Should contain array(struct(...))
+        assertTrue(expr1100.contains("array(struct("));
+        assertTrue(expr1100.contains("as prvDiaSources"));
+        // Should include basic fields
+        assertTrue(expr1100.contains("prvDiaSources.diaSourceId as diaSourceId"));
+        assertTrue(expr1100.contains("prvDiaSources.visit as visit"));
+        assertTrue(expr1100.contains("prvDiaSources.ra as ra"));
+        // CRITICAL: Should NOT include trailAlgorithm
+        assertFalse(expr1100.contains("trailAlgorithm"), 
+                "Schema 1100 should NOT include trailAlgorithm in prvDiaSources");
+        
+        // Test with schema 1102 (with trailAlgorithm)
+        Schema prvDiaSourcesSchema1102 = Schema.createArray(diaSourceSchema1102);
+        String expr1102 = buildColumnExpression(
+                Schema.createUnion(Arrays.asList(Schema.create(Schema.Type.NULL), prvDiaSourcesSchema1102)),
+                "prvDiaSources", "");
+        
+        System.out.println("Schema 1102 prvDiaSources expression:");
+        System.out.println(expr1102);
+        
+        // Should contain array(struct(...))
+        assertTrue(expr1102.contains("array(struct("));
+        assertTrue(expr1102.contains("as prvDiaSources"));
+        // Should include trailAlgorithm
+        assertTrue(expr1102.contains("trailAlgorithm"), 
+                "Schema 1102 SHOULD include trailAlgorithm in prvDiaSources");
     }
 }

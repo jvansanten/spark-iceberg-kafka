@@ -198,8 +198,29 @@ public final class AlertsToKafka {
             }
             return "struct(" + String.join(", ", nestedFields) + ") as " + fieldName;
         } else if (type == Schema.Type.ARRAY) {
-            // Array type: reference directly (Iceberg/Spark will handle the array)
-            return fullPath;
+            // Array type: recursively process the element type
+            Schema elementSchema = resolvedSchema.getElementType();
+            Schema resolvedElementSchema = resolveUnion(elementSchema);
+            
+            if (resolvedElementSchema.getType() == Schema.Type.RECORD) {
+                // Element is a record: build struct() for element type
+                List<String> elementFields = new ArrayList<>();
+                for (Schema.Field elementField : resolvedElementSchema.getFields()) {
+                    String elementExpr = buildColumnExpression(
+                        elementField.schema(), 
+                        elementField.name(), 
+                        fullPath
+                    );
+                    elementFields.add(elementExpr + " as " + elementField.name());
+                }
+                return "array(struct(" + String.join(", ", elementFields) + ")) as " + fieldName;
+            } else if (isPrimitiveType(resolvedElementSchema)) {
+                // Element is primitive: wrap in array()
+                return "array(" + fullPath + ") as " + fieldName;
+            } else {
+                // Other cases: fall back to direct reference
+                return fullPath;
+            }
         } else if (type == Schema.Type.MAP) {
             // Map type: reference directly
             return fullPath;
