@@ -204,17 +204,22 @@ public final class AlertsToKafka {
             
             if (resolvedElementSchema.getType() == Schema.Type.RECORD) {
                 // Array of records: build struct for each element explicitly
-                // In Iceberg, we can reference prvDiaSources.diaSourceId to get array of that field
+                // Use the lambda variable x to access element fields
                 List<String> elementFieldExprs = new ArrayList<>();
                 for (Schema.Field elemField : resolvedElementSchema.getFields()) {
                     Schema elemFieldResolved = resolveUnion(elemField.schema());
                     if (elemFieldResolved.getType() == Schema.Type.RECORD) {
-                        // Nested record within array element - recurse
-                        String nestedExpr = buildColumnExpression(elemField.schema(), elemField.name(), fullPath);
-                        elementFieldExprs.add(nestedExpr + " as " + elemField.name());
+                        // Nested record within array element - build nested struct
+                        // Reference the nested field via x.fieldName
+                        String nestedPath = "x." + elemField.name();
+                        List<String> nestedFields = new ArrayList<>();
+                        for (Schema.Field nestedElemField : elemFieldResolved.getFields()) {
+                            nestedFields.add(nestedPath + "." + nestedElemField.name() + " as " + nestedElemField.name());
+                        }
+                        elementFieldExprs.add("struct(" + String.join(", ", nestedFields) + ") as " + elemField.name());
                     } else {
-                        // Primitive or other type - reference directly
-                        elementFieldExprs.add(fullPath + "." + elemField.name() + " as " + elemField.name());
+                        // Primitive or other type - reference via lambda variable
+                        elementFieldExprs.add("x." + elemField.name() + " as " + elemField.name());
                     }
                 }
                 return "transform(" + fullPath + ", x -> struct(" + String.join(", ", elementFieldExprs) + ")) as " + fieldName;

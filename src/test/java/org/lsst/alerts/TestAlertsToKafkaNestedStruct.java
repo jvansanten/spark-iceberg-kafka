@@ -153,7 +153,7 @@ public class TestAlertsToKafkaNestedStruct {
         
         Schema arraySchema = Schema.createArray(pointSchema);
         String expr = buildColumnExpression(arraySchema, "points", "");
-        assertEquals("transform(points, x -> struct(points.x as x, points.y as y)) as points", expr);
+        assertEquals("transform(points, x -> struct(x.x as x, x.y as y)) as points", expr);
     }
 
     @Test
@@ -303,7 +303,7 @@ public class TestAlertsToKafkaNestedStruct {
         String pdfsExpr = buildColumnExpression(
                 Schema.createUnion(Arrays.asList(Schema.create(Schema.Type.NULL), prvDiaForcedSourcesSchema)),
                 "prvDiaForcedSources", "");
-        assertEquals("transform(prvDiaForcedSources, x -> struct(prvDiaForcedSources.diaForcedSourceId as diaForcedSourceId, prvDiaForcedSources.ra as ra)) as prvDiaForcedSources", pdfsExpr);
+        assertEquals("transform(prvDiaForcedSources, x -> struct(x.diaForcedSourceId as diaForcedSourceId, x.ra as ra)) as prvDiaForcedSources", pdfsExpr);
 
         // Test building diaObject (nullable record)
         String dioExpr = buildColumnExpression(
@@ -410,10 +410,10 @@ public class TestAlertsToKafkaNestedStruct {
         // Should contain transform(struct(...))
         assertTrue(expr1100.contains("transform(prvDiaSources, x -> struct("));
         assertTrue(expr1100.contains("as prvDiaSources"));
-        // Should include basic fields
-        assertTrue(expr1100.contains("prvDiaSources.diaSourceId as diaSourceId"));
-        assertTrue(expr1100.contains("prvDiaSources.visit as visit"));
-        assertTrue(expr1100.contains("prvDiaSources.ra as ra"));
+        // Should include basic fields (accessed via lambda variable x)
+        assertTrue(expr1100.contains("x.diaSourceId as diaSourceId"));
+        assertTrue(expr1100.contains("x.visit as visit"));
+        assertTrue(expr1100.contains("x.ra as ra"));
         // CRITICAL: Should NOT include trailAlgorithm
         assertFalse(expr1100.contains("trailAlgorithm"), 
                 "Schema 1100 should NOT include trailAlgorithm in prvDiaSources");
