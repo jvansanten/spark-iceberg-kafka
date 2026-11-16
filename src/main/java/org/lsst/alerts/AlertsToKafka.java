@@ -198,27 +198,28 @@ public final class AlertsToKafka {
             }
             return "struct(" + String.join(", ", nestedFields) + ") as " + fieldName;
         } else if (type == Schema.Type.ARRAY) {
-            // Array type: recursively process the element type
+            // Array type: need to handle element schema
             Schema elementSchema = resolvedSchema.getElementType();
             Schema resolvedElementSchema = resolveUnion(elementSchema);
             
             if (resolvedElementSchema.getType() == Schema.Type.RECORD) {
-                // Element is a record: build struct() for element type
-                List<String> elementFields = new ArrayList<>();
-                for (Schema.Field elementField : resolvedElementSchema.getFields()) {
-                    String elementExpr = buildColumnExpression(
-                        elementField.schema(), 
-                        elementField.name(), 
-                        fullPath
-                    );
-                    elementFields.add(elementExpr + " as " + elementField.name());
+                // Array of records: build struct for each element explicitly
+                // In Iceberg, we can reference prvDiaSources.diaSourceId to get array of that field
+                List<String> elementFieldExprs = new ArrayList<>();
+                for (Schema.Field elemField : resolvedElementSchema.getFields()) {
+                    Schema elemFieldResolved = resolveUnion(elemField.schema());
+                    if (elemFieldResolved.getType() == Schema.Type.RECORD) {
+                        // Nested record within array element - recurse
+                        String nestedExpr = buildColumnExpression(elemField.schema(), elemField.name(), fullPath);
+                        elementFieldExprs.add(nestedExpr + " as " + elemField.name());
+                    } else {
+                        // Primitive or other type - reference directly
+                        elementFieldExprs.add(fullPath + "." + elemField.name() + " as " + elemField.name());
+                    }
                 }
-                return "array(struct(" + String.join(", ", elementFields) + ")) as " + fieldName;
-            } else if (isPrimitiveType(resolvedElementSchema)) {
-                // Element is primitive: wrap in array()
-                return "array(" + fullPath + ") as " + fieldName;
+                return "transform(" + fullPath + ", x -> struct(" + String.join(", ", elementFieldExprs) + ")) as " + fieldName;
             } else {
-                // Other cases: fall back to direct reference
+                // Array of primitives: reference directly
                 return fullPath;
             }
         } else if (type == Schema.Type.MAP) {
